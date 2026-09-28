@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+order_env/
+.env
+node_modules/
+dist/
+*.db
+.streamlit/secrets.toml
