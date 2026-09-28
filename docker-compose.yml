@@ -1,0 +1,27 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    volumes:
+      - ./app:/app/app
+
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_USER: orderops
+      MYSQL_PASSWORD: orderops
+      MYSQL_DATABASE: orderops
+      MYSQL_ROOT_PASSWORD: root
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysqldata:/var/lib/mysql
+
+volumes:
+  mysqldata:
