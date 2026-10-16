@@ -1,292 +1,244 @@
 # OrderOps AI
 
-Autonomous Order Triage & Resolution Agent - checks inventory automatically,
-negotiates a substitute item with the customer by email when something is
-out of stock (instead of just cancelling the order), and falls back to a
-refund if the customer declines or doesn't respond.
+An agentic order-resolution system for e-commerce. When a customer orders an item that is out of stock, the agent does not cancel the order. It offers a discounted in-stock substitute by email, waits for the customer's decision, and then either updates the order or refunds it.
 
-Built as a Saylani Agentic AI course project.
+Built with FastAPI, LangGraph, SQLAlchemy, Alembic, MySQL and Streamlit.
 
----
+## Workflow
 
-## 1. Project structure
+```
+New order
+   |
+   v
+check_fraud_risk --(risk >= threshold)--> flag_manual_audit --> END
+   |
+   v
+validate_inventory --(all in stock)--> finalize_order --> END (fulfilled)
+   |
+   v (an item is out of stock)
+generate_alternative --> send_negotiation --> await_customer_response
+                                                      |
+                                    customer clicks Accept / Reject in the email
+                                                      |
+                                                      v
+                                              finalize_order
+                                  accepted -> item swapped, order fulfilled
+                                  rejected -> order refunded
+```
+
+- `await_customer_response` uses LangGraph's `interrupt()`. The run genuinely pauses, and `POST /orders` returns with the order in `awaiting_response`.
+- The email contains two links (Accept / Reject) that call `GET /orders/{id}/respond`. This resumes the same run with `Command(resume=decision)`. Earlier nodes are not re-executed.
+- Clicking a link twice is safe: a negotiation that already has an answer is ignored.
+- Every step is written to the `audit_logs` table.
+
+## Tech stack
+
+| Layer | Technology |
+|---|---|
+| Orchestration | LangGraph (StateGraph, conditional edges, `interrupt` / `Command`) |
+| API | FastAPI (async) |
+| Database | MySQL 8 |
+| ORM / migrations | SQLAlchemy 2 (async, `aiomysql`) and Alembic (`pymysql`) |
+| Email | SMTP (`smtplib`, run in a thread) |
+| Dashboard | Streamlit with Graphviz |
+
+## Project structure
 
 ```
 orderops-ai/
 ├── app/
 │   ├── api/
-│   │   ├── orders.py            # create/lookup order, negotiation response webhook + email link
-│   │   ├── customers.py         # list customers (for the Streamlit dropdown)
-│   │   ├── products.py          # list products (for the Streamlit dropdown)
-│   │   └── metrics.py           # revenue recovery metric
+│   │   ├── orders.py          # create/get order, respond endpoints
+│   │   ├── negotiations.py    # full negotiation history
+│   │   ├── customers.py       # customer list
+│   │   ├── products.py        # product list
+│   │   └── metrics.py         # revenue recovery
 │   ├── services/
 │   │   ├── fraud_service.py
 │   │   ├── inventory_service.py
-│   │   ├── negotiation_service.py   # builds the negotiation email (with Accept/Reject links)
-│   │   └── notification_service.py  # real SMTP send
+│   │   ├── negotiation_service.py   # substitute selection + email body
+│   │   └── notification_service.py  # SMTP sending
 │   ├── workflow/
-│   │   ├── state.py             # LangGraph OrderState
-│   │   ├── nodes.py             # node functions (await_customer_response uses interrupt())
-│   │   └── graph.py             # StateGraph wiring, conditional edges
-│   ├── config.py                 # Settings (reads .env)
-│   ├── database.py               # SQLAlchemy async engine, session, Base
-│   ├── models.py                  # all ORM models
-│   ├── schemas.py                  # Pydantic request/response schemas
-│   └── main.py                      # FastAPI app entrypoint
-├── migrations/                # Alembic migrations (MySQL schema)
-├── streamlit_app/             # Streamlit dashboard (navy/black theme, no emojis)
-├── seed_data.py                # seeds ~100 products + ~20 customers into MySQL
+│   │   ├── state.py           # OrderState
+│   │   ├── nodes.py           # graph nodes
+│   │   └── graph.py           # StateGraph wiring
+│   ├── config.py              # settings loaded from .env
+│   ├── database.py            # async engine, session, Base
+│   ├── models.py              # ORM models
+│   ├── schemas.py             # Pydantic schemas
+│   └── main.py                # FastAPI app
+├── migrations/                # Alembic (initial MySQL schema)
+├── streamlit_app/             # Dashboard
+│   ├── app.py                 # Dashboard page
+│   ├── pages/                 # Orders, Negotiations
+│   └── lib/                   # API client, theme
 ├── tests/
-├── requirements.txt
-├── alembic.ini
+├── seed_data.py               # demo data
 ├── Dockerfile
 ├── docker-compose.yml
+├── alembic.ini
+├── requirements.txt
 └── .env.example
 ```
 
-## 2. How it works
+## Database
 
-1. A new order comes in through `POST /orders` (or via the Streamlit
-   "Create test order" form, which pulls real customers/products from
-   MySQL into dropdowns).
-2. A LangGraph `StateGraph` runs the order through a pipeline of nodes:
-   `check_fraud_risk -> validate_inventory -> generate_alternative ->
-   send_negotiation -> await_customer_response -> finalize_order`.
-3. If an item is out of stock, the agent picks an in-stock substitute from
-   the same category, and emails the customer an offer with a discount and
-   two links: **Accept substitute** and **Reject and refund me**.
-4. `await_customer_response` calls `langgraph.types.interrupt()` - this is
-   a genuine pause. The graph run suspends right there; `POST /orders`
-   returns immediately with the order in `awaiting_response` status.
-   Nothing upstream (fraud check, inventory check, negotiation) re-runs
-   when the customer eventually responds.
-5. Clicking either link in the email hits `GET /orders/{id}/respond`,
-   which resumes the exact same paused run with
-   `Command(resume=decision)` - "accepted" routes to fulfillment (item is
-   swapped to the substitute), "rejected" routes to refund. The dashboard
-   in Streamlit can do the same thing via `POST /orders/{id}/customer-response`.
-6. Everything is logged to `audit_logs`, and recovery performance is
-   exposed at `GET /metrics/revenue-recovery`.
+Six tables, created by `migrations/versions/0001_initial_schema.py`:
 
-See `app/workflow/graph.py` and `app/workflow/nodes.py` for the exact
-routing logic and the `interrupt()` call.
+| Table | Purpose |
+|---|---|
+| `customers` | Name, email, phone, preferences |
+| `products` | SKU, name, stock, price, category |
+| `orders` | Status, risk score, timestamps |
+| `order_items` | Product, quantity, stock status per order |
+| `negotiations` | Offered substitute, discount, channel, customer response |
+| `audit_logs` | Event trail per order |
 
-**Note on the checkpointer:** it's in-memory (`MemorySaver`), rebuilt as a
-process-wide singleton so a paused run survives between the initial
-`POST /orders` call and the later resume call (email link click or
-Streamlit button). This keeps setup dependency-free (no separate
-checkpoint database/driver), but a paused negotiation is lost if the API
-process restarts before the customer responds. Swap in a persistent
-checkpointer (SQLite/Redis/Postgres) before this goes anywhere near
-production.
+Order statuses: `pending`, `risk_flagged`, `validating`, `negotiating`, `awaiting_response`, `fulfilled`, `refunded`, `cancelled`.
 
-## 3. Prerequisites
+## Setup
+
+### Prerequisites
 
 - Python 3.11+
-- MySQL 8.x (or Docker, which bundles it)
-- An SMTP account to send real negotiation emails (optional - without one,
-  emails are printed to the console instead, and the rest of the flow
-  still works via the Streamlit Accept/Reject buttons)
+- MySQL 8 (local install, MySQL Workbench, or Docker)
+- Graphviz system package (needed by the dashboard's pipeline diagram): https://graphviz.org/download/
+- An SMTP account (optional, see below)
 
-## 4. Backend setup
-
-### 4.1 Clone and configure
+### 1. Install and configure
 
 ```bash
-git clone <your-repo-url>
 cd orderops-ai
-cp .env.example .env
-```
-
-`.env` defaults already match the bundled Docker MySQL container
-(`orderops` / `orderops` / db `orderops`) - leave as-is if using Docker.
-
-### 4.2 SMTP setup (optional but recommended)
-
-To actually receive negotiation emails, fill in `.env`:
-
-```
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USERNAME=your.email@gmail.com
-SMTP_PASSWORD=<a Gmail App Password, not your normal password>
-SMTP_FROM_EMAIL=your.email@gmail.com
-```
-
-For Gmail: enable 2-Step Verification on the account, then create an App
-Password at myaccount.google.com/apppasswords and use that as
-`SMTP_PASSWORD`. Any other SMTP provider (Outlook, SendGrid SMTP relay,
-your own mail server) works the same way - just change host/port.
-
-Also set:
-
-```
-APP_BASE_URL=http://localhost:8000
-TEST_CUSTOMER_EMAIL=you@example.com
-```
-
-`APP_BASE_URL` is used to build the Accept/Reject links in the email -
-change it if the backend is reachable at a different host/port.
-`TEST_CUSTOMER_EMAIL` is only read by `seed_data.py` (see section 6) - set
-it to your real inbox so you receive actual negotiation emails during
-testing.
-
-Leaving SMTP settings blank is fine - emails are printed to the terminal
-instead, and you can still resolve negotiations from the Streamlit
-Negotiations page's Accept/Reject buttons.
-
-### 4.3 Run with Docker (recommended)
-
-```bash
-docker compose up --build
-```
-
-Starts the FastAPI API (port 8000) and MySQL (port 3306).
-
-### 4.4 Run migrations
-
-```bash
-docker compose exec api alembic upgrade head
-```
-
-Creates all six tables: `customers`, `products`, `orders`, `order_items`,
-`negotiations`, `audit_logs`.
-
-### 4.5 Or run locally without Docker
-
-Install and start MySQL yourself, create a database and user matching
-your `.env`, then:
-
-```bash
 python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+venv\Scripts\activate            # macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env             # Windows: copy .env.example .env
+```
+
+### 2. Create the MySQL database
+
+```sql
+CREATE DATABASE orderops;
+CREATE USER 'orderops'@'localhost' IDENTIFIED BY 'orderops';
+GRANT ALL PRIVILEGES ON orderops.* TO 'orderops'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+The defaults in `.env.example` match this. If you use different credentials, update `DATABASE_URL` and `ALEMBIC_DATABASE_URL`.
+
+### 3. Run migrations
+
+```bash
 alembic upgrade head
-uvicorn app.main:app --reload
 ```
 
-### 4.6 Verify
-
-```bash
-curl http://localhost:8000/health
-```
-
-API docs: http://localhost:8000/docs
-
-## 5. Streamlit dashboard setup
-
-```bash
-cd streamlit_app
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-**Graphviz system package required** for the pipeline diagram:
-- Windows: `choco install graphviz`
-- Mac: `brew install graphviz`
-- Ubuntu/Debian: `sudo apt install graphviz`
-
-```bash
-cp .env.example .env      # sets API_BASE_URL=http://localhost:8000
-streamlit run app.py
-```
-
-Opens at http://localhost:8501. Start the FastAPI backend first, and seed
-the database (section 6) or the dropdowns will be empty.
-
-Pages:
-- **Dashboard** (`app.py`) - KPI cards, agent pipeline diagram
-- **Orders** - "Look up order" (status, pipeline position, negotiation
-  history), or "Create test order" with live customer/product dropdowns
-  pulled from MySQL
-- **Negotiations** - view an order's negotiations and Accept/Reject them
-  directly (does the same thing as clicking the email links)
-
-## 6. Seeding demo data
-
-The database starts empty. Seed ~20 customers and ~100 products across 8
-categories:
+### 4. Seed demo data
 
 ```bash
 python seed_data.py
 ```
 
-Safe to run multiple times (skips anything that already exists, matched
-by email/SKU). About 30% of products are randomly out of stock, so
-ordering one of those triggers the negotiation/email flow; the rest go
-straight to fulfillment.
+Inserts 100 products across 8 categories (about 30% out of stock) and 21 customers. One customer uses the email in `TEST_CUSTOMER_EMAIL`, so set that to your own inbox in `.env` before seeding. The script is safe to re-run.
 
-One customer is special: it uses whatever email you set as
-`TEST_CUSTOMER_EMAIL` in `.env`, so ordering as that customer sends a real
-negotiation email to your own inbox (if SMTP is configured). Every other
-seeded customer gets a placeholder `name@example.com` address.
+### 5. Start the API
 
-The script prints the seeded IDs and a couple of example out-of-stock /
-in-stock product IDs when it finishes - useful if you want to call the
-API directly instead of going through Streamlit.
+```bash
+uvicorn app.main:app --reload
+```
 
-## 7. Testing
+API docs: http://localhost:8000/docs
+
+### 6. Start the dashboard
+
+In a second terminal:
+
+```bash
+cd streamlit_app
+pip install -r requirements.txt
+cp .env.example .env
+streamlit run app.py
+```
+
+Opens at http://localhost:8501.
+
+### Docker (optional)
+
+```bash
+docker compose up --build
+docker compose exec api alembic upgrade head
+```
+
+Inside the API container the database host is `db`, not `localhost`. Set `DATABASE_URL` and `ALEMBIC_DATABASE_URL` in `.env` to use `@db:3306` when running this way.
+
+## Email (SMTP)
+
+Set these in `.env` to send real negotiation emails:
+
+```
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=your.email@gmail.com
+SMTP_PASSWORD=<Gmail App Password>
+SMTP_FROM_EMAIL=your.email@gmail.com
+APP_BASE_URL=http://localhost:8000
+```
+
+For Gmail, turn on 2-Step Verification and create an App Password at myaccount.google.com/apppasswords. `APP_BASE_URL` is used to build the Accept / Reject links, so it must be reachable from wherever the customer opens the email.
+
+If SMTP is not configured, the email is printed to the API terminal instead, and negotiations can still be resolved from the dashboard.
+
+## Dashboard pages
+
+- **Dashboard**: revenue recovery rate, agent pipeline diagram, recent negotiation history.
+- **Orders**: look up an order (status, pipeline position, its negotiations), or create a test order using customer and product dropdowns loaded from MySQL.
+- **Negotiations**: full negotiation history across all orders, plus Accept / Reject buttons for a given order (same effect as the email links).
+
+## API reference
+
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/orders` | Create an order and run it through the agent |
+| GET | `/orders/{id}` | Order with items |
+| GET | `/orders/{id}/negotiations` | Negotiations for one order |
+| POST | `/orders/{id}/customer-response` | Resume with a decision (JSON body) |
+| GET | `/orders/{id}/respond?negotiation_id=&decision=` | Email link handler (`accepted` or `rejected`) |
+| GET | `/negotiations?limit=` | Negotiation history, newest first |
+| GET | `/customers` | Customer list |
+| GET | `/products` | Product list |
+| GET | `/metrics/revenue-recovery` | Accepted vs total negotiations |
+| GET | `/health` | Health check |
+
+## Configuration
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Async MySQL URL used by the API |
+| `ALEMBIC_DATABASE_URL` | Sync MySQL URL used by Alembic |
+| `APP_BASE_URL` | Base URL for email links |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM_EMAIL`, `SMTP_USE_TLS` | Email delivery |
+| `TEST_CUSTOMER_EMAIL` | Real email for the seeded test customer (read by `seed_data.py` only) |
+| `NEGOTIATION_DISCOUNT_PCT` | Discount offered on the substitute |
+| `FRAUD_RISK_THRESHOLD` | Orders at or above this score go to manual audit |
+| `NEGOTIATION_RESPONSE_TIMEOUT_HOURS` | Shown in the email; not enforced yet |
+| `LLM_PROVIDER`, `OPENAI_API_KEY`, `GOOGLE_API_KEY` | Reserved for LLM-written offers; not used yet |
+
+The dashboard has its own `streamlit_app/.env` with `API_BASE_URL`.
+
+## Testing
 
 ```bash
 pytest
 ```
 
-## 8. What's a stub vs. what's real
+Covers the graph's conditional routing functions.
 
-Real and wired up: FastAPI routes, SQLAlchemy models, Alembic migration,
-LangGraph state machine with a genuine `interrupt()`/`Command(resume=...)`
-pause-and-resume (verified end-to-end: fraud check does NOT re-run on
-resume), real SMTP email with clickable Accept/Reject links, the
-Streamlit dashboard talking to the live API with real MySQL-backed
-dropdowns.
+## Current limitations
 
-Intentionally stubbed - replace before production use:
-- `app/services/fraud_service.py` - random risk score
-- `app/services/negotiation_service.py` - naive same-category product
-  match and a templated email; replace with real similarity search and
-  an LLM call (`LLM_PROVIDER` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` are
-  already in `.env` for this)
-- The checkpointer is in-memory (see the note in section 2)
-- No timeout sweeper job for negotiations that never get a reply (the
-  email says "24 hours", but nothing currently enforces that)
-- No auth on any route
-
-## 9. Pushing this project to GitHub
-
-1. Create an empty repo on GitHub (no README/license, you already have
-   files locally).
-2. From the `orderops-ai/` folder:
-
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit: OrderOps AI backend + Streamlit dashboard"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/orderops-ai.git
-   git push -u origin main
-   ```
-
-3. If GitHub asks for authentication: Settings -> Developer settings ->
-   Personal access tokens -> generate one with `repo` scope, use it in
-   place of your password when prompted (or use `gh auth login` if you
-   have the GitHub CLI).
-
-4. Going forward:
-
-   ```bash
-   git add .
-   git commit -m "Describe what changed"
-   git push
-   ```
-
-**Before pushing:** double-check `.env` is in `.gitignore` (it is by
-default) so your real SMTP password and other secrets never get
-committed.
-
-## 10. Environment variables reference
-
-See `.env.example` (backend) and `streamlit_app/.env.example` (dashboard)
-for the full list - MySQL connection, `APP_BASE_URL`, SMTP settings,
-`TEST_CUSTOMER_EMAIL`, LLM provider keys, negotiation discount/timeout
-policy, and the fraud risk threshold.
+- **Fraud check is a stub.** It returns a random score; replace `fraud_service.py` with real rules or a model.
+- **Substitute selection is simple.** It picks any in-stock product from the same category. If none exists, the negotiation cannot be created.
+- **Only the first out-of-stock item** in an order is negotiated.
+- **Email text is templated.** The LLM settings are in place but not wired up.
+- **Paused runs are held in memory** (`MemorySaver`). If the API restarts while a customer has not yet answered, that run is lost. A persistent checkpointer is needed for production.
+- **No timeout handling.** An unanswered negotiation stays in `awaiting_response`.
+- **Dashboard gaps.** Active orders, pending negotiations and average processing time show placeholders because there is no order-list endpoint yet.
+- **No authentication** on any endpoint.
